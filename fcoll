@@ -1,0 +1,204 @@
+#!/bin/env tumblr_ruby
+# Runs a func-command against a group of hosts specified by a set of Collins
+# selectors.
+#
+# Usage: fcoll --selector=<selectors> <command>
+
+require 'json'
+require 'optparse'
+require 'yaml'
+require 'shellwords'
+
+require 'collins_client'
+
+
+COLLINS_CREDS_LOC = "/var/db/collins.yaml"
+FUNC_TRANSMIT_CMD = "/usr/bin/func-transmit --json"
+
+DEFAULT_ASYNC = false
+DEFAULT_FORKS = 1
+DEFAULT_TIMEOUT = 600
+DEFAULT_SIZE  = 3000
+
+SIZABLE_ATTRIBUTES = [ :memory_size_total, :disk_storage_total ]
+SELECTOR_DEFAULTS = { :status => :allocated, :size => DEFAULT_SIZE }
+
+
+def collins
+  if not @collins
+    creds_hash = YAML::load(File.open(COLLINS_CREDS_LOC))
+    collins_options = { :host     => "https://#{creds_hash["server"]}",
+                        :username => creds_hash["username"],
+                        :password => creds_hash["password"],
+                        :timeout => DEFAULT_TIMEOUT
+                      }
+
+    @collins = ::Collins::Client.new collins_options
+  end
+  @collins
+end
+
+# This string-to-selector converter was ganked from collins-shell.
+def get_selector selector, defaults = SELECTOR_DEFAULTS
+  asset_params = ::Collins::Asset::Find.to_a.inject({}) {|res,el| res.update(el.to_s.upcase => el)}
+  hash_with_defaults = SELECTOR_DEFAULTS.clone.merge(Collins::Util.symbolize_hash(selector))
+  selector = hash_with_defaults.inject({}) do |result, (k,v)|
+    upcase_key = k.to_s.upcase
+    if asset_params.key?(upcase_key) then # normalized reserved params
+      corrected_key = asset_params[upcase_key]
+      if ::Collins::Asset::Find::DATE_PARAMS.include?(corrected_key) then
+        result[corrected_key.to_sym] = ::Collins::Asset.format_date_string(v)
+      else
+        result[corrected_key.to_sym] = v
+      end
+    elsif upcase_key == k.to_s then # respect case
+      result[k] = v
+    else # otherwise downcase
+      result[k.downcase] = v
+    end
+    result
+  end
+  if not selector.include?(:operation) then
+    selector.update(:operation => 'and')
+  end
+  SIZABLE_ATTRIBUTES.each do |attrib|
+    attrib_value = selector[attrib]
+    if attrib_value && attrib_value.to_s.is_disk_size? then
+      selector.update(attrib => attrib_value.to_s.to_bytes)
+    end
+  end
+  selector
+end
+
+def get_options
+  options = Hash.new
+  optparse = OptionParser.new do |opts|
+#    opts.banner = "Usage: fcoll [options] <shell command to run>"
+
+    options[:verbose] = false
+    opts.on("-v", "--verbose", "Verbose message") do |verbose|
+      options[:verbose] = verbose
+    end
+
+    options[:async] = DEFAULT_ASYNC
+    opts.on("-a", "--[no-]async", "Use async mode") do |async|
+      options[:async] = async
+    end
+
+    options[:forks] = DEFAULT_FORKS
+    opts.on("-f", "--forks <num_forks>",
+        "Number of forks to use") do |forks|
+      options[:forks] = forks.to_i
+    end
+
+    options[:timeout] = DEFAULT_TIMEOUT
+    opts.on("-t", "--timeout <timeout_secs>",
+        "Command timeout in seconds") do |timeout|
+      options[:timeout] = timeout.to_i
+    end
+
+    options[:input] = false
+    opts.on("-i", "--input", "Read host list from stdin") do |input|
+      options[:input] = input
+    end
+
+    options[:oneline] = false
+    opts.on("-1", "--oneline", "First line of output only") do |oneline|
+      options[:oneline] = oneline
+    end
+
+    opts.on("-s", "--selector <selector>",
+        "Collins selector to use") do |selector|
+      selector_hash = Hash.new
+      selector.split.each do |tuple|
+        split_tuple = tuple.split ':'
+        selector_hash[split_tuple[0]] = split_tuple[1]
+      end
+      options[:selector] = get_selector(selector_hash, SELECTOR_DEFAULTS)
+    end
+
+    options[:confirmed] = false
+    opts.on("-y", "--[no-]yes", "Answer yes to all prompts") do |yes|
+      options[:confirmed] = yes
+    end
+  end
+  optparse.parse!
+  if not options[:selector] and ! options[:input]
+    puts "--selector or --input must be specified"
+    puts optparse
+    exit -1
+  end
+  return options, Shellwords.join(ARGV)
+#  return options, ARGV.shelljoin(' ')
+end
+
+def call_func options, command
+  if options[:input]
+    hosts = $stdin.readlines
+    hosts.delete_if {|x| x.start_with?('#') or /^\s*$/.match(x) }
+    hosts.each {|x| x.chomp!}
+  else
+    hosts = collins.find(options[:selector]).map(&:hostname)
+  end
+  if hosts.length == 0
+    puts "No hosts were found for the selector: #{options[:selector]}; exiting"
+    exit -2
+  end
+  # Sets default and specified parameters for Func command execution.
+  transmit_hash = Hash.new
+  transmit_hash["async"] = options[:async]
+  transmit_hash["nforks"] = options[:forks]
+  transmit_hash["timeout"] = options[:timeout]
+  transmit_hash["module"] = "command"
+  transmit_hash["method"] = "run"
+  transmit_hash["parameters"] = command
+  transmit_hash["clients"] = hosts.join ";"
+  if not options[:confirmed]
+    puts "Will execute across the following hosts:"
+    hosts.each { |host| puts " - #{host}" }
+    puts "Command: '#{command}', forks: #{options[:forks]}, timeout: #{options[:timeout]}"
+    if options[:input] and ! $stdin.tty?
+      $stdin = File.new('/dev/tty')
+    end
+    while true
+      print "Is this OK? [y/n]: "
+      case $stdin.gets.strip.downcase
+      when 'y'
+        break
+      when 'n'
+        puts "Exiting on user request."
+        exit -3
+      end
+    end
+  end
+  puts "Executing '#{command}' against #{hosts.length} hosts..."
+  result_json = IO.popen(FUNC_TRANSMIT_CMD, "r+") do |func|
+    func.write JSON::dump(transmit_hash)
+    func.close_write
+    func.read
+  end
+  puts "Results:"
+  if result_json
+    JSON::load(result_json).each do |host, results|
+      host = host.split('.')[0] unless options[:verbose]
+      if results.methods.include?('length') and results.length == 3
+        puts " - Host: #{host}, exit code: #{results[0]}"
+        puts results[1] + results[2]
+      else
+        if options[:oneline] then
+          line = results[1].split("\n").first
+          ecode = results[0].to_s
+          puts " - #{host.to_s}(#{ecode}) #{line}"
+        else
+          puts " - #{host.to_s} #{results.to_s}"
+        end
+      end
+    end
+  else
+    puts "no results"
+  end
+end
+
+
+options, command = get_options
+call_func options, command
