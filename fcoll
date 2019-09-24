@@ -80,6 +80,11 @@ def get_options
       options[:verbose] = verbose
     end
 
+    options[:pass] = false
+    opts.on("-p", "--pass", "pass command without shell escaping") do |pass|
+      options[:pass] = pass
+    end
+
     options[:async] = DEFAULT_ASYNC
     opts.on("-a", "--[no-]async", "Use async mode") do |async|
       options[:async] = async
@@ -128,8 +133,11 @@ def get_options
     puts optparse
     exit -1
   end
-  return options, Shellwords.join(ARGV)
-#  return options, ARGV.shelljoin(' ')
+  if options[:pass]
+    return options, ARGV.join(' ')
+  else
+    return options, Shellwords.join(ARGV)
+  end
 end
 
 def call_func options, command
